@@ -27,19 +27,20 @@ const client = new MongoClient(uri, {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
     
     const userCollection = client.db("bistroDB").collection("users");
     const menuCollection = client.db("bistroDB").collection("menu");
     const reviewsCollection = client.db("bistroDB").collection("reviews");
+    const reservationCollection = client.db("bistroDB").collection("reservations");
     const cartCollection = client.db("bistroDB").collection("carts");
-    const paymentCollection = client.db("bistroDb").collection("payments");
+    const paymentCollection = client.db("bistroDB").collection("payments");
  
     //jwt related api
     app.post('/jwt', async(req,res) =>{
      const user = req.body;
      const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
-      expiresIn: '1h' });
+      expiresIn: '1d' });
       res.send({ token });
     })
 
@@ -176,7 +177,16 @@ async function run() {
         res.send(result);
     })
 
-    //carts collection
+    app.post("/reviews", async (req, res) => {
+      const review = req.body;
+
+      const result = await reviewsCollection.insertOne(review);
+
+      res.send(result);
+    });
+
+
+      //carts collection
     app.get('/carts', async(req,res) =>{
       const email = req.query.email;
       const query = {email: email};
@@ -196,6 +206,7 @@ async function run() {
       const result = await cartCollection.deleteOne(query);
       res.send(result);
     })
+
 
     //payment intent
     app.post('/create-payment-intent', async(req, res) =>{
@@ -224,10 +235,14 @@ async function run() {
 
     app.post('/payments', async (req, res) => {
       const payment = req.body;
+      payment.status = "Paid"; 
+      payment.date = new Date();
+
       const paymentResult = await paymentCollection.insertOne(payment);
 
       //  carefully delete each item from the cart
-      console.log('payment info', payment);
+      // console.log('payment info', payment);
+
       const query = {
         _id: {
           $in: payment.cartIds.map(id => new ObjectId(id))
@@ -240,9 +255,422 @@ async function run() {
     })
 
 
+  //reservations
+    app.get("/admin/reservations", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await reservationCollection.find().toArray();
+      res.send(result);
+    });
+
+  app.get('/reservations', verifyToken, async (req, res) => {
+    const email = req.query.email;
+
+    if (email !== req.decoded.email) {
+      return res.status(403).send({ message: "forbidden access" });
+    }
+
+    const query = { email };
+
+    const result = await reservationCollection.find(query).toArray();
+
+    res.send(result);
+  });
+
+    app.post("/reservations", verifyToken, async (req, res) => {
+      const reservation = req.body;
+
+      reservation.status = "pending";
+
+      const result = await reservationCollection.insertOne(reservation);
+
+      res.send(result);
+    });
+
+    app.delete("/reservations/:id", async (req, res)=>{
+      const id = req.params.id;
+      const query = {_id: new ObjectId(id)}
+      const result = await reservationCollection.deleteOne(query);
+      res.send(result);
+    })
+
+    
+    //stats or analytics
+    app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
+      const users = await userCollection.estimatedDocumentCount();
+      const menuItems = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+
+      //not best way
+      // const payments = await paymentCollection.find().toArray();
+      // const revenue = payments.reduce((total, payment) => total + payment.price, 0);
+      
+      const result = await paymentCollection.aggregate([
+        {
+          $group:{
+            _id: null,
+            totalRevenue: {
+              $sum: '$price'
+            }
+          }
+        }
+      ]).toArray();
+      const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+
+      res.send({ 
+        users, 
+        menuItems, 
+        orders,
+        revenue
+      });
+    })
+
+
+    //order status
+    // using aggregate 
+    app.get('/order-stats', verifyToken, verifyAdmin, async (req, res) => { 
+      const result = await paymentCollection.aggregate([
+        {
+          $unwind: '$menuItemIds'
+        },
+        {
+          $lookup:{
+            from: 'menu',
+            localField: 'menuItemIds',
+            foreignField: '_id',
+            as: 'menuItems'
+          }
+        },
+        {
+          $unwind: '$menuItems'
+        },
+        {
+          $group: {
+            _id: '$menuItems.category',
+            quantity: { $sum: 1},
+            revenue: { $sum: '$menuItems.price' }
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            category: '$_id',
+            quantity: '$quantity',
+            revenue: '$revenue'
+          }
+        }
+
+      ]).toArray();
+
+      res.send(result)
+    })
+
+app.get("/user-stats", verifyToken, async (req, res) => {
+  const email = req.query.email;
+
+  // if (email !== req.decoded.email) {
+  //   return res.status(403).send({ message: "forbidden access" });
+  // }
+
+  try {
+    // Total orders (before payment or order collection)
+    const orderCount = await paymentCollection.countDocuments({ email });
+
+    // Payments (successful)
+    const paymentCount = await paymentCollection.countDocuments({ email });
+
+    // Reservations / bookings
+    const bookingsCount = await reservationCollection.countDocuments({ email });
+
+    const itemResult = await paymentCollection.aggregate([
+      { $match: { email } },
+      {
+        $project: {
+          count: { $size: { $ifNull: ["$menuItemIds", []] } }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          itemCount: { $sum: "$count" }
+        }
+      }
+    ]).toArray();
+
+    const itemCount = itemResult[0]?.itemCount || 0;
+
+    // Total spent
+    const revenueResult = await paymentCollection.aggregate([
+      { $match: { email } },
+      {
+        $group: {
+          _id: null,
+          totalSpent: { $sum: "$price" },
+        },
+      },
+    ]).toArray();
+
+    const totalSpent =
+      revenueResult.length > 0 ? revenueResult[0].totalSpent : 0;
+
+    res.send({
+      orderCount,        
+      paymentCount,      
+      bookingsCount,
+      totalSpent,
+      itemCount
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: error.message });
+  }
+});
+
+///admin/reservations
+app.get('/admin/reservations', verifyToken, verifyAdmin, async (req, res) => {
+    const result = await reservationCollection
+        .find()
+        .sort({ date: 1 })
+        .toArray();
+
+    res.send(result);
+});
+
+app.patch('/admin/reservations/:id', verifyToken, verifyAdmin, async (req, res) => {
+    const id = req.params.id;
+    const { status, cancelReason } = req.body;
+
+    const result = await reservationCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+            $set: {
+                status,
+                cancelReason: cancelReason || ""
+            }
+        }
+    );
+
+    res.send(result);
+});
+
+app.delete('/admin/reservations/:id', verifyToken, verifyAdmin, async (req, res) => {
+    const id = req.params.id;
+
+    const result = await reservationCollection.deleteOne({
+        _id: new ObjectId(id)
+    });
+
+    res.send(result);
+});
+
+
+//profile
+  app.get("/profile", verifyToken, async (req, res) => {
+    const email = req.decoded.email;
+
+    const user = await userCollection.findOne(
+      { email },
+      {
+        projection: {
+          password: 0
+        }
+      }
+    );
+
+    res.send(user);
+  });
+
+  app.patch("/profile", verifyToken, async (req, res) => {
+  const email = req.decoded.email;
+
+  const { name, phone, address } = req.body;
+
+  const updatedDoc = {
+    $set: {
+      name,
+      phone,
+      address
+    }
+  };
+
+  const result = await userCollection.updateOne(
+    { email },
+    updatedDoc
+  );
+
+  res.send(result);
+});
+
+app.delete("/profile", verifyToken, async (req, res) => {
+
+  const email = req.decoded.email;
+
+  const result = await userCollection.deleteOne({
+    email
+  });
+
+  res.send(result);
+});
+
+// details of user
+app.get(
+  "/admin/users/:email/details",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+
+    const email = req.params.email;
+
+    try {
+
+      // ---------------- User ----------------
+      const user = await userCollection.findOne({ email });
+
+      // ---------------- Payments ----------------
+      const payments = await paymentCollection
+        .find({ email })
+        .sort({ date: -1 })
+        .toArray();
+
+      const paymentCount = payments.length;
+
+      // ---------------- Orders ----------------
+      const orderCount = paymentCount;
+
+      // ---------------- Total Spent ----------------
+      const totalSpent = payments.reduce(
+        (sum, payment) => sum + payment.price,
+        0
+      );
+
+      // ---------------- Bookings ----------------
+      const bookings = await reservationCollection
+        .find({ email })
+        .sort({ date: -1 })
+        .toArray();
+
+      const bookingsCount = bookings.length;
+
+      // ---------------- Purchased Items ----------------
+
+      const itemAggregation = await paymentCollection.aggregate([
+
+        {
+          $match: { email }
+        },
+
+        {
+          $unwind: "$menuItemIds"
+        },
+
+        {
+          $lookup: {
+            from: "menu",
+            localField: "menuItemIds",
+            foreignField: "_id",
+            as: "item"
+          }
+        },
+
+        {
+          $unwind: "$item"
+        },
+
+        {
+          $group: {
+            _id: "$item.name",
+            quantity: {
+              $sum: 1
+            },
+            price: { $first: "$item.price" },
+            totalPrice: { $sum: "$item.price" }
+          }
+        },
+
+        {
+          $project: {
+            _id: 0,
+            name: "$_id",
+            quantity: 1,
+            price: 1,
+            totalPrice: 1
+          }
+        }
+
+      ]).toArray();
+
+      const itemCount = itemAggregation.reduce(
+        (sum, item) => sum + item.quantity,
+        0
+      );
+
+      // ---------------- Recent Payments ----------------
+
+      // const recentPayments = payments.slice(0, 5).map(payment => ({
+        
+      //   date: payment.date,
+      //   price: payment.price,
+      //   totalItems: payment.menuItemIds?.length || 0
+      // }));
+
+      const recentPayments = await Promise.all(
+      payments.slice(0, 5).map(async (payment) => {
+
+        const ids = payment.menuItemIds.map(id => new ObjectId(id));
+
+        const menuItems = await menuCollection
+          .find({ _id: { $in: ids } })
+          .project({ name: 1 })
+          .toArray();
+
+        return {
+          date: payment.date,
+          price: payment.price,
+          totalItems: payment.menuItemIds.length,
+          items: menuItems.map(item => item.name)
+        };
+      })
+    );
+
+      res.send({
+
+        name: user?.name,
+        email: user?.email,
+        phone: user?.phone || "",
+        address: user?.address || "",
+        role: user?.role || "user",
+        photo: user?.photo || "",
+
+        orderCount,
+        paymentCount,
+        bookingsCount,
+        itemCount,
+        totalSpent,
+
+        items: itemAggregation,
+
+        recentPayments,
+
+        bookings
+
+      });
+
+    }
+    catch (error) {
+
+      console.log(error);
+
+      res.status(500).send({
+        message: error.message
+      });
+
+    }
+
+  }
+);
+
+
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
+    // await client.db("admin").command({ ping: 1 });
+    // console.log("Pinged your deployment. You successfully connected to MongoDB!");
 
 
   } finally {
@@ -255,21 +683,11 @@ run().catch(console.dir);
 
 
 app.get('/', (req, res) => {
-  res.send('Bistro Boss server is running')
+  res.send('Bistro server is running')
 })
 
 app.listen(port, () => {
-  console.log(`Bistro Boss server is running on port ${port}`)
+  console.log(`Bistro server is running on port ${port}`)
 })
 
 
-/**
- * Naming convention
- * 
- * app.get('/users')
- * app.get('/users/:id')
- * app.post('/users')
- * app.put('/users/:id')
- * app.patch('/users/:id')
- * app.delete('/users/:id')
- */
